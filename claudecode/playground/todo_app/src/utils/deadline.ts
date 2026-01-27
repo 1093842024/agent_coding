@@ -1,9 +1,11 @@
+import { Translations } from '../i18n';
+
 export interface DeadlineStatus {
   text: string;
   class: string;
 }
 
-export const getDeadlineStatus = (deadline: string): DeadlineStatus => {
+export const getDeadlineStatus = (deadline: string, t: Translations['deadline']): DeadlineStatus => {
   if (!deadline) return { text: '', class: '' };
 
   const today = new Date();
@@ -15,12 +17,12 @@ export const getDeadlineStatus = (deadline: string): DeadlineStatus => {
   const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
   if (diffDays < 0) {
-    return { text: `已过期 ${Math.abs(diffDays)} 天`, class: 'overdue' };
+    return { text: t.overdue(Math.abs(diffDays)), class: 'overdue' };
   } else if (diffDays === 0) {
-    return { text: '今天到期', class: 'today' };
+    return { text: t.today, class: 'today' };
   } else if (diffDays === 1) {
-    return { text: '明天到期', class: 'today' };
+    return { text: t.tomorrow, class: 'today' };
   } else {
-    return { text: `${diffDays} 天后到期`, class: '' };
+    return { text: t.inDays(diffDays), class: '' };
   }
 };

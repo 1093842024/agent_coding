@@ -1,12 +1,13 @@
 import { Category } from '../types';
+import { Translations } from '../i18n';
 
-export const categoryLabels: Record<Category, string> = {
-  work: '工作',
-  personal: '个人',
-  study: '学习',
-  other: '其他',
-};
+export const categoryLabels = (t: Translations['input']['category']) => ({
+  work: t.work,
+  personal: t.personal,
+  study: t.study,
+  other: t.other,
+});
 
-export const getCategoryLabel = (category: Category): string => {
-  return categoryLabels[category] || '其他';
+export const getCategoryLabel = (category: Category, labels: Record<Category, string>): string => {
+  return labels[category] || '其他';
 };
