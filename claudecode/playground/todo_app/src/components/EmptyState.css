@@ -1,0 +1,21 @@
+.empty-state {
+  text-align: center;
+  padding: 60px 20px;
+  color: #a0aec0;
+}
+
+.empty-state-icon {
+  font-size: 64px;
+  margin-bottom: 20px;
+  opacity: 0.5;
+}
+
+.empty-state-text {
+  font-size: 18px;
+  margin-bottom: 10px;
+}
+
+.empty-state-hint {
+  font-size: 14px;
+  opacity: 0.7;
+}
