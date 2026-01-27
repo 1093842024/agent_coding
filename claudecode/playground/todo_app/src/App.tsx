@@ -3,11 +3,14 @@ import { TodoInput } from './components/TodoInput';
 import { TodoList } from './components/TodoList';
 import { FilterButtons } from './components/FilterButtons';
 import { Stats } from './components/Stats';
+import { LanguageToggle } from './components/LanguageToggle';
 import { useTodos } from './hooks/useTodos';
 import { useFilter } from './hooks/useFilter';
+import { useTranslation } from './hooks/useTranslation';
 import './App.css';
 
 function App() {
+  const { t } = useTranslation();
   const { todos, addTodo, toggleTodo, deleteTodo, updateTodo } = useTodos();
   const { filter, setFilter } = useFilter();
 
@@ -40,7 +43,8 @@ function App() {
 
   return (
     <div className="app-container">
-      <h1 className="app-title">我的待办事项</h1>
+      <LanguageToggle />
+      <h1 className="app-title">{t.app.title}</h1>
 
       <TodoInput onAdd={addTodo} />
 

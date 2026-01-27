@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Category } from '../types';
+import { useTranslation } from '../hooks/useTranslation';
 import './TodoInput.css';
 
 interface TodoInputProps {
@@ -7,6 +8,7 @@ interface TodoInputProps {
 }
 
 export function TodoInput({ onAdd }: TodoInputProps) {
+  const { t } = useTranslation();
   const [text, setText] = useState('');
   const [category, setCategory] = useState<Category>('work');
   const [deadline, setDeadline] = useState('');
@@ -25,13 +27,13 @@ export function TodoInput({ onAdd }: TodoInputProps) {
         <input
           type="text"
           className="todo-input"
-          placeholder="添加新的待办事项..."
+          placeholder={t.input.placeholder}
           value={text}
           onChange={e => setText(e.target.value)}
           onKeyPress={e => e.key === 'Enter' && handleSubmit()}
         />
         <button className="add-btn" onClick={handleSubmit}>
-          添加
+          {t.input.addButton}
         </button>
       </div>
       <div className="input-row">
@@ -40,10 +42,10 @@ export function TodoInput({ onAdd }: TodoInputProps) {
           value={category}
           onChange={e => setCategory(e.target.value as Category)}
         >
-          <option value="work">工作</option>
-          <option value="personal">个人</option>
-          <option value="study">学习</option>
-          <option value="other">其他</option>
+          <option value="work">{t.input.category.work}</option>
+          <option value="personal">{t.input.category.personal}</option>
+          <option value="study">{t.input.category.study}</option>
+          <option value="other">{t.input.category.other}</option>
         </select>
         <input
           type="date"

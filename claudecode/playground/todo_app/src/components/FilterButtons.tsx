@@ -1,4 +1,5 @@
 import { Filter } from '../types';
+import { useTranslation } from '../hooks/useTranslation';
 import './FilterButtons.css';
 
 interface FilterButtonsProps {
@@ -7,17 +8,19 @@ interface FilterButtonsProps {
 }
 
 export function FilterButtons({ currentFilter, onFilterChange }: FilterButtonsProps) {
+  const { t } = useTranslation();
+
   const filters: { value: Filter; label: string }[] = [
-    { value: 'all', label: '全部' },
-    { value: 'active', label: '未完成' },
-    { value: 'completed', label: '已完成' },
+    { value: 'all', label: t.filter.all },
+    { value: 'active', label: t.filter.active },
+    { value: 'completed', label: t.filter.completed },
   ];
 
   const categories: { value: Filter; label: string }[] = [
-    { value: 'work', label: '工作' },
-    { value: 'personal', label: '个人' },
-    { value: 'study', label: '学习' },
-    { value: 'other', label: '其他' },
+    { value: 'work', label: t.input.category.work },
+    { value: 'personal', label: t.input.category.personal },
+    { value: 'study', label: t.input.category.study },
+    { value: 'other', label: t.input.category.other },
   ];
 
   return (
