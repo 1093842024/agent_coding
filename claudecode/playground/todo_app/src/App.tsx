@@ -1,5 +1,4 @@
 import { useMemo } from 'react';
-import { Todo, Filter } from './types';
 import { TodoInput } from './components/TodoInput';
 import { TodoList } from './components/TodoList';
 import { FilterButtons } from './components/FilterButtons';

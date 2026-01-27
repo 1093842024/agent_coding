@@ -13,7 +13,7 @@ export function FilterButtons({ currentFilter, onFilterChange }: FilterButtonsPr
     { value: 'completed', label: '已完成' },
   ];
 
-  const categories = [
+  const categories: { value: Filter; label: string }[] = [
     { value: 'work', label: '工作' },
     { value: 'personal', label: '个人' },
     { value: 'study', label: '学习' },
