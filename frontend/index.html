@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Response Comparison Tool</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 30px;
+        }
+
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+
+        header p {
+            opacity: 0.9;
+        }
+
+        .input-section {
+            background: white;
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 30px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+        }
+
+        .question-input {
+            width: 100%;
+            min-height: 120px;
+            padding: 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            font-size: 16px;
+            resize: vertical;
+            transition: border-color 0.3s;
+        }
+
+        .question-input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .platforms {
+            display: flex;
+            gap: 15px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+
+        .platform-checkbox {
+            display: none;
+        }
+
+        .platform-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 20px;
+            background: #f5f5f5;
+            border-radius: 25px;
+            cursor: pointer;
+            transition: all 0.3s;
+            user-select: none;
+        }
+
+        .platform-label:hover {
+            background: #e8e8e8;
+        }
+
+        .platform-checkbox:checked + .platform-label {
+            background: #667eea;
+            color: white;
+        }
+
+        .platform-checkbox:checked + .platform-label .platform-dot {
+            background: white;
+        }
+
+        .platform-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #667eea;
+        }
+
+        .submit-btn {
+            display: block;
+            width: 100%;
+            max-width: 200px;
+            margin: 25px auto 0;
+            padding: 14px 30px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 25px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .submit-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        .submit-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+
+        .spinner {
+            width: 50px;
+            height: 50px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .results-section {
+            display: none;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            padding: 12px 24px;
+            background: white;
+            border: none;
+            border-radius: 8px 8px 0 0;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            color: #666;
+            transition: all 0.3s;
+        }
+
+        .tab.active {
+            background: white;
+            color: #667eea;
+            box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.1);
+        }
+
+        .tab-content {
+            background: white;
+            border-radius: 0 16px 16px 16px;
+            padding: 30px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+        }
+
+        .tab-panel {
+            display: none;
+        }
+
+        .tab-panel.active {
+            display: block;
+        }
+
+        .response-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+        }
+
+        .response-card {
+            background: #f9f9f9;
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .response-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #eee;
+        }
+
+        .platform-name {
+            font-weight: 600;
+            font-size: 16px;
+        }
+
+        .platform-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .badge-success {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .badge-error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .response-time {
+            font-size: 12px;
+            color: #999;
+        }
+
+        .response-text {
+            white-space: pre-wrap;
+            line-height: 1.6;
+            color: #333;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .analysis-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+
+        .analysis-table th,
+        .analysis-table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+
+        .analysis-table th {
+            background: #f5f5f5;
+            font-weight: 600;
+        }
+
+        .analysis-table tr:hover {
+            background: #f9f9f9;
+        }
+
+        .question-display {
+            background: #f0f0f0;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .question-label {
+            font-weight: 600;
+            color: #666;
+            margin-bottom: 5px;
+        }
+
+        .status-section {
+            margin-bottom: 20px;
+        }
+
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .status-card {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+        }
+
+        .status-card h4 {
+            margin-bottom: 10px;
+            color: #333;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .status-logged-in {
+            background: #28a745;
+        }
+
+        .status-logged-out {
+            background: #dc3545;
+        }
+
+        .login-instructions {
+            font-size: 13px;
+            color: #666;
+            margin-top: 10px;
+            padding: 10px;
+            background: #fff3cd;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>LLM Response Comparison</h1>
+            <p>Compare responses from 智谱AI, 千问, Kimi, MiniMax</p>
+        </header>
+
+        <div class="input-section">
+            <textarea
+                class="question-input"
+                id="questionInput"
+                placeholder="Enter your question here..."
+            ></textarea>
+
+            <div class="platforms">
+                <input type="checkbox" id="zhipu" class="platform-checkbox" value="zhipu" checked>
+                <label for="zhipu" class="platform-label">
+                    <span class="platform-dot"></span>
+                    智谱AI
+                </label>
+
+                <input type="checkbox" id="qwen" class="platform-checkbox" value="qwen" checked>
+                <label for="qwen" class="platform-label">
+                    <span class="platform-dot"></span>
+                    千问
+                </label>
+
+                <input type="checkbox" id="kimi" class="platform-checkbox" value="kimi" checked>
+                <label for="kimi" class="platform-label">
+                    <span class="platform-dot"></span>
+                    Kimi
+                </label>
+
+                <input type="checkbox" id="minimax" class="platform-checkbox" value="minimax" checked>
+                <label for="minimax" class="platform-label">
+                    <span class="platform-dot"></span>
+                    MiniMax
+                </label>
+            </div>
+
+            <button class="submit-btn" id="submitBtn" onclick="submitQuestion()">
+                Compare Responses
+            </button>
+        </div>
+
+        <div id="loadingSection" class="loading" style="display: none;">
+            <div class="spinner"></div>
+            <p>Querying multiple LLM platforms...</p>
+        </div>
+
+        <div id="resultsSection" class="results-section">
+            <div class="tabs">
+                <button class="tab active" onclick="switchTab('raw')">Raw Responses</button>
+                <button class="tab" onclick="switchTab('analysis')">Analysis</button>
+            </div>
+
+            <div class="tab-content">
+                <div id="rawPanel" class="tab-panel active">
+                    <div class="question-display">
+                        <div class="question-label">Question:</div>
+                        <div id="displayQuestion"></div>
+                    </div>
+                    <div id="responseGrid" class="response-grid"></div>
+                </div>
+
+                <div id="analysisPanel" class="tab-panel">
+                    <h2>Response Analysis</h2>
+                    <div id="analysisContent"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function submitQuestion() {
+            const question = document.getElementById('questionInput').value.trim();
+            if (!question) {
+                alert('Please enter a question');
+                return;
+            }
+
+            const platforms = [];
+            document.querySelectorAll('.platform-checkbox:checked').forEach(cb => {
+                platforms.push(cb.value);
+            });
+
+            if (platforms.length === 0) {
+                alert('Please select at least one platform');
+                return;
+            }
+
+            const submitBtn = document.getElementById('submitBtn');
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Querying...';
+
+            document.getElementById('loadingSection').style.display = 'block';
+            document.getElementById('resultsSection').style.display = 'none';
+
+            try {
+                // Call MCP server (assuming it's running on port 8000)
+                const response = await fetch('http://localhost:8000/query', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        question: question,
+                        platforms: platforms
+                    })
+                });
+
+                const data = await response.json();
+                displayResults(question, data);
+            } catch (error) {
+                // Fallback: show mock data for demonstration
+                console.error('Error:', error);
+                alert('MCP server not running. Showing demo data.');
+                showDemoData(question);
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Compare Responses';
+                document.getElementById('loadingSection').style.display = 'none';
+            }
+        }
+
+        function displayResults(question, data) {
+            document.getElementById('resultsSection').style.display = 'block';
+            document.getElementById('displayQuestion').textContent = question;
+
+            const grid = document.getElementById('responseGrid');
+            grid.innerHTML = '';
+
+            data.responses.forEach(resp => {
+                const card = document.createElement('div');
+                card.className = 'response-card';
+
+                const badgeClass = resp.status === 'success' ? 'badge-success' : 'badge-error';
+                const responseText = resp.status === 'success'
+                    ? (resp.response?.text || 'No response')
+                    : (resp.response?.error || 'Unknown error');
+
+                card.innerHTML = `
+                    <div class="response-header">
+                        <div>
+                            <span class="platform-name">${resp.platform.toUpperCase()}</span>
+                            <span class="response-time">${resp.elapsed_time?.toFixed(2) || 0}s</span>
+                        </div>
+                        <span class="platform-badge ${badgeClass}">${resp.status}</span>
+                    </div>
+                    <div class="response-text">${escapeHtml(responseText)}</div>
+                `;
+
+                grid.appendChild(card);
+            });
+
+            // Display analysis
+            displayAnalysis(data.analysis);
+        }
+
+        function displayAnalysis(analysis) {
+            const content = document.getElementById('analysisContent');
+
+            let html = `
+                <div class="status-section">
+                    <h3>Summary</h3>
+                    <p>Total Platforms: ${analysis.total_platforms} |
+                       Successful: ${analysis.successful} |
+                       Failed: ${analysis.failed}</p>
+                </div>
+
+                <table class="analysis-table">
+                    <thead>
+                        <tr>
+                            <th>Platform</th>
+                            <th>Status</th>
+                            <th>Response Time</th>
+                            <th>Word Count</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+            `;
+
+            analysis.platforms.forEach(p => {
+                html += `
+                    <tr>
+                        <td>${p.platform}</td>
+                        <td>${p.status}</td>
+                        <td>${p.elapsed_time?.toFixed(2) || 0}s</td>
+                        <td>${p.word_count || 0}</td>
+                    </tr>
+                `;
+            });
+
+            html += '</tbody></table>';
+
+            // AI Comparison section (placeholder)
+            html += `
+                <div style="margin-top: 30px;">
+                    <h3>AI Quality Comparison</h3>
+                    <p style="color: #666; margin-top: 10px;">
+                        Quality analysis would be performed by an AI model here.
+                        Key factors: answer accuracy, completeness, logical structure, and conclusion consistency.
+                    </p>
+                </div>
+            `;
+
+            content.innerHTML = html;
+        }
+
+        function showDemoData(question) {
+            const demoData = {
+                responses: [
+                    {
+                        platform: 'zhipu',
+                        status: 'success',
+                        elapsed_time: 3.5,
+                        response: { text: '这是智谱AI的演示回答。在实际使用中，这里会显示来自智谱AI的真实回复。' }
+                    },
+                    {
+                        platform: 'qwen',
+                        status: 'success',
+                        elapsed_time: 2.8,
+                        response: { text: '这是千问的演示回答。在实际使用中，这里会显示来自千问的真实回复。' }
+                    },
+                    {
+                        platform: 'kimi',
+                        status: 'success',
+                        elapsed_time: 4.2,
+                        response: { text: '这是Kimi的演示回答。在实际使用中，这里会显示来自Kimi的真实回复。' }
+                    },
+                    {
+                        platform: 'minimax',
+                        status: 'success',
+                        elapsed_time: 3.1,
+                        response: { text: '这是MiniMax的演示回答。在实际使用中，这里会显示来自MiniMax的真实回复。' }
+                    }
+                ],
+                analysis: {
+                    total_platforms: 4,
+                    successful: 4,
+                    failed: 0,
+                    platforms: [
+                        { platform: 'zhipu', status: 'success', elapsed_time: 3.5, word_count: 25 },
+                        { platform: 'qwen', status: 'success', elapsed_time: 2.8, word_count: 22 },
+                        { platform: 'kimi', status: 'success', elapsed_time: 4.2, word_count: 28 },
+                        { platform: 'minimax', status: 'success', elapsed_time: 3.1, word_count: 24 }
+                    ]
+                }
+            };
+
+            displayResults(question, demoData);
+        }
+
+        function switchTab(tabName) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+
+            if (tabName === 'raw') {
+                document.querySelector('.tab:first-child').classList.add('active');
+                document.getElementById('rawPanel').classList.add('active');
+            } else {
+                document.querySelector('.tab:last-child').classList.add('active');
+                document.getElementById('analysisPanel').classList.add('active');
+            }
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Check server status on load
+        async function checkServerStatus() {
+            try {
+                const response = await fetch('http://localhost:8000/health');
+                if (response.ok) {
+                    console.log('MCP server is running');
+                }
+            } catch (error) {
+                console.log('MCP server not running - demo mode');
+            }
+        }
+
+        checkServerStatus();
+    </script>
+</body>
+</html>
