@@ -20,11 +20,11 @@
 ## 安装
 
 ```bash
-# 安装依赖
-pip install -e .
+# 使用 uv 安装依赖（推荐）
+uv sync --extra test
 
 # 安装 Playwright 浏览器
-playwright install chromium
+uv run playwright install chromium
 ```
 
 ## 使用方式
@@ -46,11 +46,11 @@ playwright install chromium
 ### 方式2: 网页界面
 
 ```bash
-# 启动MCP服务器
-python -m src.server --port 8000
+# 启动MCP服务器（stdio 模式）
+uv run python -m src.server
 
-# 或使用HTTP传输
-python -m src.server 8000
+# 或使用HTTP传输（端口8000）
+uv run python -m src.server 8000
 
 # 然后打开 frontend/index.html
 ```
@@ -109,10 +109,21 @@ python -m src.server 8000
 
 ## 技术栈
 
-- Python 3.11+
+- Python 3.13
+- uv (包管理)
 - MCP (FastMCP)
 - Playwright
 - Pydantic
+
+## 测试
+
+```bash
+# 运行所有测试
+uv run pytest
+
+# 运行单个测试文件
+uv run pytest tests/test_models.py
+```
 
 ## 许可证
 
