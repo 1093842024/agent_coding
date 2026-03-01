@@ -1,21 +1,23 @@
 # LLM Comparison MCP Server
 
-一个MCP服务器工具，可以同时通过智谱AI、千问、Kimi和MiniMax四个大模型网页平台回答问题，并收集结果进行对比分析。
+在**智谱AI、千问、Kimi、MiniMax** 四个大模型网页上同时提问，并在一个对比页中并排查看回复的 MCP 服务器。
 
-## 功能特性
+## 功能概览
 
-- **多平台并行查询**: 同时向4个LLM平台发送问题
-- **Cookie自动管理**: 自动读取/保存Cookie，失败则提示用户手动登录
-- **响应对比**: 并排显示原始回复
-- **AI分析**: 自动评估回答质量和一致性
-- **双重接口**: 支持MCP工具调用 + 网页界面
+- **多平台并行**：一次向 4 个 LLM 网页发送同一问题，勾选即可选择参与平台。
+- **网页对比界面**：HTTP 模式启动后自动打开/复用浏览器，提供对比页（`http://localhost:8000/`），支持「发送问题」「获取回复并对比」；回复以 **Markdown** 展示。
+- **浏览器常驻**：用 Ctrl+C 结束程序时**不会**关闭浏览器和已打开的标签，下次启动会优先复用已有窗口并只补开缺失的 Tab。
+- **Cookie / 用户数据**：登录态保存在 `~/.llm_comparison_cookies/`，再次启动可沿用。
+- **双模式**：支持 **stdio**（仅 MCP 工具调用）与 **HTTP**（Web 界面 + 同上能力）。
 
 ## 支持的平台
 
-- 智谱AI (Zhipu AI)
-- 千问 (Qwen/Tongyi)
-- Kimi (Moonshot AI)
-- MiniMax
+| 平台   | 标识符  | 网址 |
+|--------|---------|------|
+| 智谱AI | zhipu   | https://chatglm.cn/ |
+| 千问   | qwen    | https://www.qianwen.com/ |
+| Kimi   | kimi    | https://www.kimi.com/ |
+| MiniMax| minimax | https://agent.minimaxi.com/ |
 
 ## 安装
 
@@ -23,107 +25,83 @@
 # 使用 uv 安装依赖（推荐）
 uv sync --extra test
 
-# 安装 Playwright 浏览器
+# 安装 Playwright 使用的 Chromium
 uv run playwright install chromium
 ```
 
+要求：Python ≥3.11。
+
 ## 使用方式
 
-### 方式1: MCP工具调用
-
-配置MCP服务器后，可以使用以下工具：
-
-```json
-{
-  "name": "llm_compare",
-  "parameters": {
-    "question": "什么是人工智能？",
-    "platforms": ["zhipu", "qwen", "kimi", "minimax"]
-  }
-}
-```
-
-### 方式2: 网页界面
+### 方式一：HTTP 模式（推荐，带对比页）
 
 ```bash
-# 启动MCP服务器（stdio 模式）
-uv run python -m src.server
-
-# 或使用HTTP传输（端口8000）
 uv run python -m src.server 8000
-
-# 然后打开 frontend/index.html
 ```
 
-## MCP工具
+- 若本机已有在 9222 端口开启调试的浏览器，会**复用**其窗口与标签（自动识别四平台页和对比页），缺的再开新 Tab。
+- 否则会以**独立进程**启动一个 Chromium，并打开 4 个平台 Tab + 1 个对比页 Tab。
+- 在浏览器中打开 **http://localhost:8000/** 即可使用对比页：
+  - 输入问题 → 选择平台 → 点击「发送问题」向各平台发送；
+  - 再点击「获取回复并对比」拉取各平台最新一条回复并排展示（Markdown 渲染）。
+- 使用 **Ctrl+C** 结束程序时，浏览器和所有标签会**保持打开**，下次启动可继续用同一窗口。
 
-### llm_compare
+### 方式二：MCP 工具调用（stdio）
 
-比较多个LLM平台的响应。
+在支持 MCP 的客户端中配置本服务器后，可调用工具，例如：
 
-```python
-{
-    "question": "你的问题",
-    "platforms": ["zhipu", "qwen", "kimi", "minimax"],  # 可选，默认全部
-    "response_format": "markdown"  # 或 "json"
-}
+- **llm_compare**：向多个平台发问并对比结果  
+  `{ "question": "你的问题", "platforms": ["zhipu", "qwen", "kimi", "minimax"], "response_format": "markdown" }`
+- **llm_query_single**：仅向一个平台发问  
+  `{ "platform": "zhipu", "question": "你的问题" }`
+- **llm_check_login**：检查各平台登录状态  
+  `{ "platform": "zhipu" }` 或不传 platform 检查全部
+- **llm_save_session**：保存当前浏览器会话 Cookie  
+  `{ "platform": "zhipu" }`
+
+启动命令：
+
+```bash
+uv run python -m src.server
 ```
 
-### llm_query_single
+## 登录与 Cookie
 
-查询单个LLM平台。
+- 首次使用需在自动打开的对应平台 Tab 中**手动登录**。
+- 登录信息保存在 `~/.llm_comparison_cookies/`（各平台一个 JSON），以及浏览器的用户数据目录，下次启动会自动加载。
+- 若某平台未登录或 Cookie 失效，在对比页操作时该平台会报错，可在对应 Tab 重新登录后再试。
 
-```python
-{
-    "platform": "zhipu",
-    "question": "你的问题"
-}
-```
+## HTTP 接口说明（供前端或脚本调用）
 
-### llm_check_login
-
-检查平台登录状态。
-
-```python
-{
-    "platform": "zhipu"  # 可选，默认检查全部
-}
-```
-
-### llm_save_session
-
-保存当前浏览器会话。
-
-```python
-{
-    "platform": "zhipu"
-}
-```
-
-## 登录流程
-
-1. 首次运行时，工具会尝试加载保存的Cookie
-2. 如果Cookie无效或不存在，会提示用户手动登录
-3. 用户在弹出的浏览器窗口中登录各平台
-4. 登录成功后，会话会自动保存供下次使用
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET  | `/` | 对比页 HTML |
+| GET  | `/health` | 健康检查 |
+| POST | `/query` | 发送问题到选中平台，body: `{ "question": "...", "platforms": ["zhipu", ...] }` |
+| GET  | `/status` | 各平台当前回复状态（可轮询） |
+| POST | `/fetch-replies` | 拉取各平台最新回复，用于并排对比 |
+| POST | `/open-platforms` | 为未打开的平台新开 Tab，body 可选 `{ "platforms": ["zhipu", ...] }` |
 
 ## 技术栈
 
-- Python 3.13
-- uv (包管理)
-- MCP (FastMCP)
-- Playwright
-- Pydantic
+- Python 3.11+
+- [uv](https://github.com/astral-sh/uv)（包管理）
+- [MCP](https://modelcontextprotocol.io/)（FastMCP）
+- [Playwright](https://playwright.dev/python/)（浏览器自动化）
+- Pydantic（数据校验）
+- 前端：单页 HTML + marked.js + DOMPurify（Markdown 展示与安全）
 
 ## 测试
 
 ```bash
-# 运行所有测试
-uv run pytest
+# 运行全部测试
+uv run python -m pytest tests/ -v
 
-# 运行单个测试文件
-uv run pytest tests/test_models.py
+# 仅运行 HTTP 相关测试
+uv run python -m pytest tests/test_http_routes.py -v
 ```
+
+测试覆盖：数据模型、Cookie、响应分析、HTTP 路由及回复抓取（含「hello」示例）。
 
 ## 许可证
 

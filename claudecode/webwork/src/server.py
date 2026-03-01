@@ -15,6 +15,9 @@ supports send-question-only, status polling (60s), and fetch-replies for compari
 import asyncio
 import json
 import os
+import shutil
+import subprocess
+import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -55,6 +58,59 @@ FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "fronten
 
 # CDP port for reconnecting to existing browser on restart (do not close browser on exit)
 CDP_PORT = 9222
+
+
+def _chromium_executable() -> Optional[str]:
+    """Return path to Chromium/Chrome for detached launch (so browser survives process exit)."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            path = getattr(p.chromium, "executable_path", None)
+            if path and os.path.isfile(path):
+                return path
+    except Exception:
+        pass
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _launch_browser_detached(user_data_dir: str, cdp_port: int) -> bool:
+    """Launch Chromium in a detached process so it keeps running after our process exits. Returns True if launched."""
+    exe = _chromium_executable()
+    if not exe:
+        return False
+    args = [
+        exe,
+        f"--user-data-dir={user_data_dir}",
+        f"--remote-debugging-port={cdp_port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(
+                args,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=os.path.expanduser("~"),
+            )
+        else:
+            subprocess.Popen(
+                args,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=os.path.expanduser("~"),
+            )
+        return True
+    except Exception:
+        return False
 
 
 # Enums
@@ -783,14 +839,34 @@ async def _http_browser_lifespan(app: Any):
         except Exception:
             pass
 
-        # No existing browser: launch new one with CDP port so next restart can reconnect
+        # No existing browser: launch new one in a detached process so it survives Ctrl+C
         os.makedirs(USER_DATA_DIR, exist_ok=True)
-        state.context = await state.playwright.chromium.launch_persistent_context(
-            USER_DATA_DIR,
-            headless=False,
-            args=[f"--remote-debugging-port={CDP_PORT}"],
-        )
-        state.browser = state.context
+        launched = _launch_browser_detached(USER_DATA_DIR, CDP_PORT)
+        if launched:
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                try:
+                    browser = await state.playwright.chromium.connect_over_cdp(
+                        f"http://127.0.0.1:{CDP_PORT}"
+                    )
+                    contexts = browser.contexts
+                    if contexts:
+                        state.browser = browser
+                        state.context = contexts[0]
+                        break
+                    await browser.close()
+                except Exception:
+                    continue
+            else:
+                launched = False
+        if not launched:
+            # Fallback: launch as child (browser will close when process exits)
+            state.context = await state.playwright.chromium.launch_persistent_context(
+                USER_DATA_DIR,
+                headless=False,
+                args=[f"--remote-debugging-port={CDP_PORT}"],
+            )
+            state.browser = state.context
 
         async def open_one_tab(platform_id: str, url: str) -> None:
             page = await state.context.new_page()

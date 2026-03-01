@@ -1,107 +1,115 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文件为 Claude Code 在本仓库中协作开发时提供项目说明与约定。
 
 ## 项目概述
 
-这是一个 MCP 服务器工具，用于同时通过智谱AI、千问、Kimi 和 MiniMax 四个中国大模型网页平台回答问题，并收集结果进行对比分析。
+本仓库是一个 **MCP 服务器**，用于在**智谱AI、千问、Kimi、MiniMax** 四个国内大模型网页平台上并行提问，并收集、对比展示回复。
 
-**HTTP 模式（推荐）**：执行 `uv run python -m src.server 8000` 时，会自动打开一个浏览器窗口，创建 4 个 Tab 分别打开四个大模型平台网站（并加载缓存的登录信息），第 5 个 Tab 打开本项目的对比页面（http://localhost:8000/）。前端提供「发送问题」与「获取回复并对比」两个按钮，并在 60 秒内轮询各平台回复状态（发送问题、等待模型响应中、模型回复中/思考中、模型已完成问题回复）。
+- **推荐用法**：HTTP 模式。执行 `uv run python -m src.server 8000` 后：
+  - 若本机已有在 CDP 端口 9222 上监听的浏览器，则**复用**其窗口与标签（按 URL 匹配四平台 + 对比页），缺的再开新 Tab。
+  - 若无，则以**独立进程**启动 Chromium（`--user-data-dir` + `--remote-debugging-port=9222`），通过 CDP 连接后新建 4 个平台 Tab 与 1 个对比页 Tab。
+  - 对比页地址：`http://localhost:8000/`，由同一服务提供静态 `frontend/index.html`。
+- **前端能力**：输入问题、勾选平台 → 「发送问题」向各平台 Tab 发送；「获取回复并对比」从各 Tab 抓取最新一条模型回复，在对比页并排以 **Markdown** 展示；「打开未打开的模型网站」可补开缺失的平台 Tab。
+- **退出行为**：Ctrl+C 仅结束本进程；**不**关闭浏览器与标签（不调用 `context.close()` / `playwright.stop()`），浏览器由独立进程或已有窗口保持运行，下次启动可继续复用。
 
 ## 常用命令
 
 ```bash
-# 使用 uv 安装依赖
+# 安装依赖（含测试）
 uv sync --extra test
 
-# 安装 Playwright 浏览器
+# 安装 Playwright 使用的 Chromium
 uv run playwright install chromium
 
-# 运行测试
+# 运行全部测试
 uv run python -m pytest tests/ -v
 
 # 运行单个测试文件
-uv run python -m pytest tests/test_models.py -v
+uv run python -m pytest tests/test_http_routes.py -v
 
-# 启动 MCP 服务器 (stdio 模式)
+# 启动 MCP 服务器（stdio 模式，仅工具调用）
 uv run python -m src.server
 
-# 启动 MCP 服务器 (HTTP 模式，端口 8000)
+# 启动 MCP 服务器（HTTP 模式，端口 8000，自动开/复用浏览器与对比页）
 uv run python -m src.server 8000
 ```
 
-## 项目架构
+## 项目结构
 
-### 核心组件
+| 路径 | 说明 |
+|------|------|
+| `src/server.py` | 服务入口：MCP 定义、HTTP 路由、浏览器生命周期、各平台发问/抓取回复逻辑 |
+| `frontend/index.html` | 对比页单页：问题输入、平台勾选、发送/拉取回复、并排展示（Markdown 渲染） |
+| `tests/` | 单元与接口测试 |
+| `pyproject.toml` | 项目与依赖配置、pytest 配置 |
 
-- **src/server.py**: MCP 服务器主入口，包含所有工具定义和平台查询逻辑
-- **frontend/index.html**: 网页界面，用于可视化和对比结果
-- **pyproject.toml**: Python 项目配置，定义依赖和测试配置
+## 技术栈
 
-### 技术栈
+- **MCP**：FastMCP，提供工具与 HTTP 能力
+- **Playwright**：浏览器自动化（访问各 LLM 网页、填表、抓取回复）
+- **Pydantic**：请求/响应与配置模型
+- **asyncio**：异步并发
+- **前端**：单 HTML，使用 marked.js + DOMPurify 做 Markdown 渲染与安全过滤
 
-- **MCP (FastMCP)**: 模型上下文协议服务器
-- **Playwright**: 浏览器自动化，用于访问各 LLM 平台网页
-- **Pydantic**: 数据验证和模型定义
-- **asyncio**: 异步并发处理
+## 支持的平台
 
-### 支持的平台
-
-| 平台 | 标识符 | URL |
-|------|--------|-----|
+| 平台 | 标识符 | 网页 URL |
+|------|--------|----------|
 | 智谱AI | zhipu | https://chatglm.cn/ |
 | 千问 | qwen | https://www.qianwen.com/ |
 | Kimi | kimi | https://www.kimi.com/ |
 | MiniMax | minimax | https://agent.minimaxi.com/ |
 
-### MCP 工具
+## 运行模式
 
-1. **llm_compare**: 并行查询多个 LLM 平台并对比结果
-2. **llm_query_single**: 查询单个 LLM 平台
-3. **llm_check_login**: 检查平台登录状态
-4. **llm_save_session**: 保存当前浏览器会话 Cookie
+### stdio 模式（无端口参数）
 
-### HTTP 模式（端口启动时）
+- `uv run python -m src.server`
+- 仅暴露 MCP 工具（如 `llm_compare`、`llm_query_single`、`llm_check_login`、`llm_save_session`），无 HTTP、不自动开浏览器。
 
-1. 启动时打开一个浏览器，依次创建 4 个 Tab 打开四个大模型网站，并读取 `~/.llm_comparison_cookies/` 下各平台 Cookie；若无缓存则需在对应 Tab 内手动登录。
-2. 第 5 个 Tab 打开对比页面（根路径 `/`）。
-3. **发送问题**：仅向各平台 Tab 发送问题，不等待或拉取回复；后台在 60s 内每 2s 轮询各页状态并更新：发送问题、等待模型响应中、模型回复中/模型思考中、模型已完成问题回复。
-4. **获取回复并对比**：从各平台页面抓取最新一条模型回复，在对比页并排展示。
+### HTTP 模式（带端口参数）
 
-### 自定义 HTTP 接口
+- `uv run python -m src.server 8000`
+- 启动时：
+  1. 尝试 `connect_over_cdp("http://127.0.0.1:9222")` 连接已有浏览器；若有 context 且存在标签，则按 URL 识别四平台页与对比页，缺的再 `new_page()` 并 `goto`。
+  2. 若未连接成功，则通过 `_launch_browser_detached()` 用 subprocess 以**独立进程**启动 Chromium（`--user-data-dir=~/.llm_comparison_cookies/browser_data`、`--remote-debugging-port=9222`），轮询 CDP 就绪后 `connect_over_cdp`，再创建 4 个平台 Tab + 1 个对比 Tab。
+  3. 若独立启动失败（如找不到 Chromium），则回退到 `launch_persistent_context(..., args=["--remote-debugging-port=9222"])`，此时浏览器为子进程，Ctrl+C 会一并退出。
+- 退出时：仅清理内存中的 `state` 与 `http_state`，**不**关闭 browser/context，浏览器窗口与标签保持打开。
 
-- `GET /`：对比页前端（index.html）
-- `GET /health`：健康检查
-- `POST /query`：发送问题到所选平台 Tab（body: `{ "question": "...", "platforms": ["zhipu", "qwen", "kimi", "minimax"] }`）
-- `GET /status`：当前各平台回复状态（供前端轮询）
-- `POST /fetch-replies`：拉取各平台最新回复并返回，用于并排对比
+## HTTP 接口
 
-### 数据流程（MCP 工具）
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/` | 对比页前端（`frontend/index.html`） |
+| GET | `/health` | 健康检查，返回 `status`、`browser_ready` |
+| POST | `/query` | 向选中平台 Tab 发送问题；body: `{ "question": "...", "platforms": ["zhipu", ...] }` |
+| GET | `/status` | 当前各平台回复状态（供前端轮询） |
+| POST | `/fetch-replies` | 从各平台 Tab 抓取最新一条模型回复，返回并排对比数据 |
+| POST | `/open-platforms` | 为未打开或已关闭的平台新开 Tab；body 可选 `{ "platforms": [...] }` |
 
-1. 用户调用 MCP 工具或通过网页界面提交问题
-2. 服务器使用 Playwright 打开各平台网页
-3. 自动加载保存的 Cookie 进行登录
-4. 在输入框填写问题并提交
-5. 等待响应并提取结果
-6. 返回并排显示的对比结果
+## 回复抓取逻辑（获取回复并对比）
 
-### Cookie 管理
+- 各平台有独立选择器列表（如 `[data-role='assistant']`、`.markdown-body`、平台相关 class），在页面内合并候选节点、按文档顺序取**最后一段长度 ≥ 15 的文本**作为回复。
+- MiniMax 额外有 `MINIMAX_FALLBACK_JS`：在主选择器未取到足够长文本时，在 `main` / 含 container、chat、conversation 的根下再找最后一段有效回复。
+- 前端收到回复后使用 marked + DOMPurify 以 Markdown 形式渲染。
 
-- Cookie 存储位置: `~/.llm_comparison_cookies/`
-- 每个平台一个 JSON 文件: `{platform}.json`
-- 首次使用需手动登录，登录成功后自动保存
+## Cookie 与用户数据
+
+- Cookie 目录：`~/.llm_comparison_cookies/`，按平台存 `{platform}.json`。
+- 浏览器持久化数据目录：`~/.llm_comparison_cookies/browser_data`（`launch_persistent_context` 或独立进程的 `--user-data-dir`）。
+- 首次使用需在对应 Tab 内手动登录；登录态会随 Cookie/用户数据保留。
 
 ## 测试
 
-测试位于 `tests/` 目录:
-- `test_models.py`: 数据模型测试
-- `test_cookies.py`: Cookie 管理测试
-- `test_analyze.py`: 响应分析测试
-- `test_http_routes.py`: HTTP 自定义路由测试（/health, /query, /status, /fetch-replies, /）
+- `tests/test_models.py`：数据模型与校验
+- `tests/test_cookies.py`：Cookie 读写
+- `tests/test_analyze.py`：响应分析逻辑
+- `tests/test_http_routes.py`：HTTP 路由与回复抓取（含 /health、/query、/status、/fetch-replies、/、hello 场景）
 
-运行全部测试：`uv run python -m pytest tests/ -v`
+运行：`uv run python -m pytest tests/ -v`
 
+## 开发与排错注意
 
-<claude-mem-context>
-
-</claude-mem-context>
+- 修改各平台网页选择器时，请同步看 `ZHIPU_REPLY_SELECTORS`、`QWEN_REPLY_SELECTORS`、`KIMI_REPLY_SELECTORS`、`MINIMAX_REPLY_SELECTORS` 及 `MINIMAX_FALLBACK_JS`。
+- 保持「退出不关浏览器」依赖：不在 lifespan 的 `finally` 里调用 `context.close()` / `playwright.stop()`；新开浏览器时优先用 `_launch_browser_detached()` 以独立进程启动，便于 Ctrl+C 后窗口保留。
