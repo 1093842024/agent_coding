@@ -7,31 +7,54 @@ This server provides tools to compare responses from multiple LLM platforms:
 - 千问 (Qwen/Tongyi)
 - Kimi (Moonshot AI)
 - MiniMax
+
+When run in HTTP mode: opens one browser with 5 tabs (4 LLM platforms + comparison page),
+supports send-question-only, status polling (60s), and fetch-replies for comparison.
 """
 
 import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
+
+import httpx
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import Response, JSONResponse, FileResponse
 
-# Initialize MCP Server
-mcp = FastMCP("llm_comparison_mcp")
+# MCP Server created after lifespan (see below)
 
 # Constants
 CHARACTER_LIMIT = 25000
 COOKIE_DIR = os.path.expanduser("~/.llm_comparison_cookies")
+USER_DATA_DIR = os.path.join(COOKIE_DIR, "browser_data")
 PLATFORM_URLS = {
-    "zhipu": "https://www.zhipuai.cn/",
-    "qwen": "https://tongyi.aliyun.com/",
-    "kimi": "https://kimi.moonshot.cn/",
-    "minimax": "https://platform.minimax.io/",
+    "zhipu": "https://chatglm.cn/",
+    "qwen": "https://www.qianwen.com/",
+    "kimi": "https://www.kimi.com/",
+    "minimax": "https://agent.minimaxi.com/",
 }
+
+# Reply status enum for web UI
+REPLY_STATUS = {
+    "question_sent": "发送问题",
+    "waiting": "等待模型响应中",
+    "replying": "模型回复中/模型思考中",
+    "done": "模型已完成问题回复",
+    "error": "错误",
+}
+
+# Frontend static path (for serving comparison page)
+FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
+
+# CDP port for reconnecting to existing browser on restart (do not close browser on exit)
+CDP_PORT = 9222
 
 
 # Enums
@@ -105,10 +128,10 @@ class LoginStatusInput(BaseModel):
     )
 
 
-# Global state
+# Global state for HTTP mode: single browser, 5 tabs, reply statuses
 @dataclass
 class BrowserPool:
-    """Manages browser instances for each platform."""
+    """Manages browser instances for each platform (legacy MCP tools)."""
     browsers: Dict[str, Any] = field(default_factory=dict)
     contexts: Dict[str, Any] = field(default_factory=dict)
 
@@ -132,18 +155,43 @@ class BrowserPool:
             await self.playwright.stop()
 
 
-# Global browser pool
+@dataclass
+class HTTPBrowserState:
+    """Single browser with 5 tabs for HTTP mode. Set by lifespan."""
+    playwright: Any = None
+    browser: Any = None
+    context: Any = None
+    pages: Dict[str, Any] = field(default_factory=dict)  # platform_id -> page
+    compare_page: Any = None
+    reply_statuses: Dict[str, str] = field(default_factory=dict)  # platform_id -> status key
+    last_question: Optional[str] = None
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 browser_pool = BrowserPool()
+http_state: Optional[HTTPBrowserState] = None
 
 
 # Cookie Management
-async def load_cookies(platform: Platform) -> Optional[Dict]:
-    """Load cookies for a platform."""
+async def load_cookies(platform: Platform) -> Optional[List[Dict]]:
+    """Load cookies for a platform. Returns list of cookie dicts or None."""
     cookie_file = os.path.join(COOKIE_DIR, f"{platform.value}.json")
     if os.path.exists(cookie_file):
         with open(cookie_file, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+            return data if isinstance(data, list) else [data]
     return None
+
+
+def _cookies_with_url(cookies: List[Dict], url: str) -> List[Dict]:
+    """Ensure each cookie has 'url' so Playwright applies to the right domain."""
+    out = []
+    for c in cookies:
+        d = dict(c)
+        if not d.get("url") and not d.get("domain"):
+            d["url"] = url
+        out.append(d)
+    return out
 
 
 async def save_cookies(platform: Platform, cookies: List[Dict]) -> None:
@@ -154,6 +202,276 @@ async def save_cookies(platform: Platform, cookies: List[Dict]) -> None:
         json.dump(cookies, f)
 
 
+# ----- Send question only (no wait for reply) -----
+async def _send_question_zhipu(page: Any, question: str) -> Optional[str]:
+    """Send question to 智谱/ChatGLM page. Tries multiple input/send patterns."""
+    try:
+        input_selectors = [
+            'textarea[placeholder*="请输入"]',
+            'textarea[placeholder*="输入"]',
+            'textarea[data-testid="chat-input"]',
+            'textarea',
+            'div[contenteditable="true"][role="textbox"]',
+            'div[contenteditable="true"]',
+            '[contenteditable="true"]',
+        ]
+        input_elem = None
+        for sel in input_selectors:
+            input_elem = await page.query_selector(sel)
+            if input_elem:
+                break
+        if not input_elem:
+            return "Could not find input box"
+        await input_elem.click()
+        await asyncio.sleep(0.2)
+        await input_elem.fill("")
+        await input_elem.fill(question)
+        await asyncio.sleep(0.1)
+        send_selectors = [
+            'button[type="submit"]',
+            'button:has-text("发送")',
+            'button:has-text("提交")',
+            '[data-testid="send-button"]',
+            '[aria-label*="发送"]',
+            'button[class*="send"]',
+            'button[class*="submit"]',
+            'div[class*="send"] button',
+            'form button[type="submit"]',
+        ]
+        for sel in send_selectors:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                return None
+        await page.keyboard.press("Enter")
+        return None
+    except Exception as e:
+        return str(e)
+
+
+async def _send_question_qwen(page: Any, question: str) -> Optional[str]:
+    try:
+        input_elem = await page.query_selector('textarea[placeholder*="输入"]') or await page.query_selector('div[contenteditable="true"]')
+        if not input_elem:
+            return "Could not find input box"
+        await input_elem.fill(question)
+        await page.keyboard.press("Enter")
+        return None
+    except Exception as e:
+        return str(e)
+
+
+async def _send_question_kimi(page: Any, question: str) -> Optional[str]:
+    try:
+        for sel in ['textarea[placeholder*="发送"]', 'textarea[placeholder*="输入"]', 'div[contenteditable="true"]']:
+            input_elem = await page.query_selector(sel)
+            if input_elem:
+                await input_elem.fill(question)
+                await page.keyboard.press("Enter")
+                return None
+        return "Could not find input box"
+    except Exception as e:
+        return str(e)
+
+
+async def _send_question_minimax(page: Any, question: str) -> Optional[str]:
+    try:
+        for sel in ['textarea[placeholder*="输入"]', 'textarea[placeholder*="问题"]', 'div[contenteditable="true"]']:
+            input_elem = await page.query_selector(sel)
+            if input_elem:
+                await input_elem.fill(question)
+                await page.keyboard.press("Enter")
+                return None
+        return "Could not find input box"
+    except Exception as e:
+        return str(e)
+
+
+async def send_question_to_page(platform_id: str, page: Any, question: str) -> Optional[str]:
+    """Send question to a single platform page. Returns error message or None."""
+    if platform_id == "zhipu":
+        return await _send_question_zhipu(page, question)
+    if platform_id == "qwen":
+        return await _send_question_qwen(page, question)
+    if platform_id == "kimi":
+        return await _send_question_kimi(page, question)
+    if platform_id == "minimax":
+        return await _send_question_minimax(page, question)
+    return "Unknown platform"
+
+
+# ----- Get latest reply text from page (platform-specific selectors) -----
+# Min length to consider as a real reply (avoid picking empty or input-like nodes)
+REPLY_MIN_TEXT_LEN = 15
+
+
+def _reply_text_js_merge_and_last(selector_list: List[str]) -> str:
+    """Build JS that collects elements matching selectors, merges in doc order, returns last with substantial text."""
+    sels_js = ", ".join(json.dumps(s) for s in selector_list)
+    min_len = REPLY_MIN_TEXT_LEN
+    return f"""
+    () => {{
+        var sels = [{sels_js}];
+        var seen = new Set();
+        var nodes = [];
+        for (var i = 0; i < sels.length; i++) {{
+            try {{
+                var list = document.querySelectorAll(sels[i]);
+                for (var j = 0; j < list.length; j++) {{
+                    var el = list[j];
+                    if (!seen.has(el)) {{
+                        seen.add(el);
+                        nodes.push(el);
+                    }}
+                }}
+            }} catch (e) {{}}
+        }}
+        if (nodes.length === 0) return '';
+        nodes.sort(function(a, b) {{
+            var p = a.compareDocumentPosition(b);
+            if (p & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (p & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+        }});
+        for (var i = nodes.length - 1; i >= 0; i--) {{
+            var el = nodes[i];
+            var text = (el.innerText || el.textContent || '').trim();
+            if (text.length >= {min_len}) return text;
+        }}
+        var last = nodes[nodes.length - 1];
+        var text = (last.innerText || last.textContent || '').trim();
+        return text || '';
+    }}
+    """
+
+
+# Prefer assistant-only selectors first so we don't pick user message or input area
+ZHIPU_REPLY_SELECTORS = [
+    "[data-role='assistant']",
+    "[class*='assistant'][class*='message']",
+    "[class*='Assistant']",
+    "[class*='message'][class*='assistant']",
+    ".markdown-body",
+    "[class*='markdown']",
+    "[class*='response'][class*='content']",
+    "[class*='Message']",
+    "article[class*='assistant']",
+    "[role='article']",
+    "[class*='bubble'][class*='assistant']",
+    "[class*='content']",
+]
+
+QWEN_REPLY_SELECTORS = [
+    "[data-role='assistant']",
+    "[class*='assistant'][class*='message']",
+    "[class*='answer']",
+    "[class*='Answer']",
+    "[class*='response']",
+    ".markdown-body",
+    "[class*='markdown']",
+    "[class*='message']",
+    "[class*='content']",
+    "article",
+    "[role='article']",
+]
+
+KIMI_REPLY_SELECTORS = [
+    "[data-testid='virtuoso-item-list'] [data-role='assistant']",
+    "[data-testid='virtuoso-item-list'] [class*='assistant']",
+    "[data-testid='virtuoso-item-list'] [class*='message']",
+    "[data-testid='virtuoso-item-list'] [class*='content']",
+    "[data-testid='virtuoso-item-list'] article",
+    "[data-role='assistant']",
+    "[class*='message'][class*='assistant']",
+    ".markdown-body",
+    "[class*='markdown']",
+    "[class*='content']",
+    "article",
+]
+
+# MiniMax (agent.minimaxi.com) often uses agent/chat-style containers; prefer last assistant-style block
+MINIMAX_REPLY_SELECTORS = [
+    "[data-role='assistant']",
+    "[class*='assistant'][class*='message']",
+    "[class*='Assistant']",
+    "[class*='agent'][class*='message']",
+    "[class*='Agent'][class*='content']",
+    "[class*='message'][class*='assistant']",
+    "[class*='chat'][class*='message']",
+    "[class*='Chat'][class*='content']",
+    "[class*='reply']",
+    "[class*='Reply']",
+    "[class*='answer']",
+    "[class*='response']",
+    "[class*='content'][class*='message']",
+    ".markdown-body",
+    "[class*='markdown']",
+    "[class*='prose']",
+    "article",
+    "[role='article']",
+]
+
+
+def _reply_text_js_for_platform(platform_id: str) -> str:
+    """Platform-specific merge-and-last reply extraction JS (last node with substantial text)."""
+    selector_map = {
+        "zhipu": ZHIPU_REPLY_SELECTORS,
+        "qwen": QWEN_REPLY_SELECTORS,
+        "kimi": KIMI_REPLY_SELECTORS,
+        "minimax": MINIMAX_REPLY_SELECTORS,
+    }
+    sels = selector_map.get(platform_id) or (
+        ZHIPU_REPLY_SELECTORS + QWEN_REPLY_SELECTORS + KIMI_REPLY_SELECTORS
+    )
+    return _reply_text_js_merge_and_last(sels)
+
+
+# MiniMax fallback: get last substantial text block from main/chat area (for varying DOM)
+MINIMAX_FALLBACK_JS = """
+() => {
+    var minLen = 15;
+    var roots = document.querySelectorAll('main, [role="main"], [class*="container"], [class*="content"], [class*="chat"], [class*="conversation"]');
+    var candidates = [];
+    for (var r = 0; r < roots.length; r++) {
+        var root = roots[r];
+        var nodes = root.querySelectorAll('[class*="message"], [class*="content"], [class*="reply"], [class*="answer"], article, .markdown-body, [class*="markdown"], [class*="prose"]');
+        for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            var text = (el.innerText || el.textContent || '').trim();
+            if (text.length >= minLen && !el.querySelector('textarea')) candidates.push({ el: el, text: text });
+        }
+    }
+    if (candidates.length === 0) return '';
+    candidates.sort(function(a, b) {
+        var p = a.el.compareDocumentPosition(b.el);
+        if (p & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (p & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        return 0;
+    });
+    return candidates[candidates.length - 1].text;
+}
+"""
+
+
+async def get_latest_reply(page: Any, platform_id: str) -> Dict[str, Any]:
+    """Extract latest assistant reply text from the platform tab."""
+    try:
+        if page.is_closed():
+            return {"text": "", "error": "page closed"}
+        await asyncio.sleep(0.3)
+        js = _reply_text_js_for_platform(platform_id)
+        text = await page.evaluate(js)
+        text = (text or "").strip()
+        # MiniMax: if primary selectors return nothing, try fallback (main/chat area last block)
+        if platform_id == "minimax" and len(text) < REPLY_MIN_TEXT_LEN:
+            fallback = await page.evaluate(MINIMAX_FALLBACK_JS)
+            if fallback and len((fallback or "").strip()) >= REPLY_MIN_TEXT_LEN:
+                text = (fallback or "").strip()
+        return {"text": text, "error": None}
+    except Exception as e:
+        return {"text": "", "error": str(e)}
+
+
 async def check_login_status(platform: Platform) -> Dict[str, Any]:
     """Check if user is logged in to a platform."""
     try:
@@ -161,20 +479,15 @@ async def check_login_status(platform: Platform) -> Dict[str, Any]:
         browser = await browser_pool.get_browser(platform)
         context = browser_pool.contexts[platform]
 
-        # Try to load saved cookies
         cookies = await load_cookies(platform)
         if cookies:
             await context.add_cookies(cookies)
 
-        # Open the platform page
         page = await context.new_page()
         await page.goto(PLATFORM_URLS[platform.value], wait_until="networkidle")
 
-        # Check if logged in (this is platform-specific logic)
-        # For now, return basic status
         is_logged_in = await page.evaluate("""
             () => {
-                // Check for common logged-in indicators
                 const indicators = [
                     document.querySelector('[data-testid="user-avatar"]'),
                     document.querySelector('.user-profile'),
@@ -202,7 +515,7 @@ async def check_login_status(platform: Platform) -> Dict[str, Any]:
 
 
 async def query_platform(platform: Platform, question: str) -> Dict[str, Any]:
-    """Query a single LLM platform."""
+    """Query a single LLM platform (legacy: full flow with wait)."""
     start_time = time.time()
 
     try:
@@ -210,17 +523,14 @@ async def query_platform(platform: Platform, question: str) -> Dict[str, Any]:
         browser = await browser_pool.get_browser(platform)
         context = browser_pool.contexts[platform]
 
-        # Load cookies if available
         cookies = await load_cookies(platform)
         if cookies:
             await context.add_cookies(cookies)
 
         page = await context.new_page()
 
-        # Navigate to platform
         await page.goto(PLATFORM_URLS[platform.value], wait_until="networkidle")
 
-        # Platform-specific query logic
         if platform == Platform.ZHIPU:
             response = await _query_zhipu(page, question)
         elif platform == Platform.QWEN:
@@ -255,44 +565,28 @@ async def query_platform(platform: Platform, question: str) -> Dict[str, Any]:
 async def _query_zhipu(page: Any, question: str) -> Dict[str, Any]:
     """Query 智谱AI (Zhipu AI)."""
     try:
-        # Find and fill the input box
         input_selectors = [
             'textarea[placeholder*="请输入"]',
             'textarea[data-testid="chat-input"]',
             'div[contenteditable="true"]'
         ]
-
         input_elem = None
         for selector in input_selectors:
             input_elem = await page.query_selector(selector)
             if input_elem:
                 break
-
         if not input_elem:
             return {"error": "Could not find input box"}
-
         await input_elem.fill(question)
-
-        # Find and click send button
-        button_selectors = [
-            'button[type="submit"]',
-            'button:has-text("发送")',
-            'button:has-text("提交")'
-        ]
-
+        button_selectors = ['button[type="submit"]', 'button:has-text("发送")', 'button:has-text("提交")']
         send_button = None
         for selector in button_selectors:
             send_button = await page.query_selector(selector)
             if send_button:
                 break
-
         if send_button:
             await send_button.click()
-
-            # Wait for response
             await page.wait_for_load_state("networkidle", timeout=30000)
-
-            # Get response text
             response_text = await page.evaluate("""
                 () => {
                     const messages = document.querySelectorAll('[class*="message"]');
@@ -300,11 +594,8 @@ async def _query_zhipu(page: Any, question: str) -> Dict[str, Any]:
                     return lastMessage ? lastMessage.innerText : '';
                 }
             """)
-
             return {"text": response_text}
-
         return {"error": "Could not find send button"}
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -312,30 +603,12 @@ async def _query_zhipu(page: Any, question: str) -> Dict[str, Any]:
 async def _query_qwen(page: Any, question: str) -> Dict[str, Any]:
     """Query 千问 (Qwen)."""
     try:
-        # Similar logic for Qwen
-        input_selectors = [
-            'textarea[placeholder*="输入"]',
-            'div[contenteditable="true"]'
-        ]
-
-        input_elem = None
-        for selector in input_selectors:
-            input_elem = await page.query_selector(selector)
-            if input_elem:
-                break
-
+        input_elem = await page.query_selector('textarea[placeholder*="输入"]') or await page.query_selector('div[contenteditable="true"]')
         if not input_elem:
             return {"error": "Could not find input box"}
-
         await input_elem.fill(question)
-
-        # Press enter to send
         await page.keyboard.press("Enter")
-
-        # Wait for response
         await page.wait_for_load_state("networkidle", timeout=30000)
-
-        # Get response
         response_text = await page.evaluate("""
             () => {
                 const responses = document.querySelectorAll('[class*="response"]');
@@ -343,9 +616,7 @@ async def _query_qwen(page: Any, question: str) -> Dict[str, Any]:
                 return lastResponse ? lastResponse.innerText : '';
             }
         """)
-
         return {"text": response_text}
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -353,26 +624,17 @@ async def _query_qwen(page: Any, question: str) -> Dict[str, Any]:
 async def _query_kimi(page: Any, question: str) -> Dict[str, Any]:
     """Query Kimi (Moonshot AI)."""
     try:
-        input_selectors = [
-            'textarea[placeholder*="发送"]',
-            'textarea[placeholder*="输入"]',
-            'div[contenteditable="true"]'
-        ]
-
+        input_selectors = ['textarea[placeholder*="发送"]', 'textarea[placeholder*="输入"]', 'div[contenteditable="true"]']
         input_elem = None
         for selector in input_selectors:
             input_elem = await page.query_selector(selector)
             if input_elem:
                 break
-
         if not input_elem:
             return {"error": "Could not find input box"}
-
         await input_elem.fill(question)
         await page.keyboard.press("Enter")
-
         await page.wait_for_load_state("networkidle", timeout=30000)
-
         response_text = await page.evaluate("""
             () => {
                 const messages = document.querySelectorAll('[class*="message"]');
@@ -380,9 +642,7 @@ async def _query_kimi(page: Any, question: str) -> Dict[str, Any]:
                 return lastMessage ? lastMessage.innerText : '';
             }
         """)
-
         return {"text": response_text}
-
     except Exception as e:
         return {"error": str(e)}
 
@@ -390,26 +650,17 @@ async def _query_kimi(page: Any, question: str) -> Dict[str, Any]:
 async def _query_minimax(page: Any, question: str) -> Dict[str, Any]:
     """Query MiniMax."""
     try:
-        input_selectors = [
-            'textarea[placeholder*="输入"]',
-            'textarea[placeholder*="问题"]',
-            'div[contenteditable="true"]'
-        ]
-
+        input_selectors = ['textarea[placeholder*="输入"]', 'textarea[placeholder*="问题"]', 'div[contenteditable="true"]']
         input_elem = None
         for selector in input_selectors:
             input_elem = await page.query_selector(selector)
             if input_elem:
                 break
-
         if not input_elem:
             return {"error": "Could not find input box"}
-
         await input_elem.fill(question)
         await page.keyboard.press("Enter")
-
         await page.wait_for_load_state("networkidle", timeout=30000)
-
         response_text = await page.evaluate("""
             () => {
                 const messages = document.querySelectorAll('[class*="message"]');
@@ -417,324 +668,392 @@ async def _query_minimax(page: Any, question: str) -> Dict[str, Any]:
                 return lastMessage ? lastMessage.innerText : '';
             }
         """)
-
         return {"text": response_text}
-
     except Exception as e:
         return {"error": str(e)}
 
 
 async def analyze_responses(responses: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Analyze responses from multiple platforms."""
-    # Simple analysis based on response length and status
     analysis = {
         "total_platforms": len(responses),
         "successful": sum(1 for r in responses if r.get("status") == "success"),
         "failed": sum(1 for r in responses if r.get("status") == "error"),
         "platforms": []
     }
-
     for response in responses:
         platform_analysis = {
             "platform": response.get("platform"),
             "status": response.get("status"),
             "elapsed_time": response.get("elapsed_time", 0),
         }
-
         if response.get("status") == "success":
             resp_text = response.get("response", {}).get("text", "")
             platform_analysis["response_length"] = len(resp_text)
             platform_analysis["word_count"] = len(resp_text.split())
         else:
             platform_analysis["error"] = response.get("response", {}).get("error", "Unknown error")
-
         analysis["platforms"].append(platform_analysis)
-
     return analysis
 
 
-# MCP Tools
-@mcp.tool(
-    name="llm_compare",
-    annotations={
-        "title": "Compare LLM Responses",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True
-    }
-)
-async def llm_compare(params: CompareLLMsInput) -> str:
-    """Compare responses from multiple LLM platforms (智谱AI, 千问, Kimi, MiniMax).
+# ----- Lifespan and MCP (must be defined before custom routes that use mcp) -----
+@asynccontextmanager
+async def _http_browser_lifespan(app: Any):
+    global http_state
+    from playwright.async_api import async_playwright
 
-    This tool sends the same question to multiple LLM platforms simultaneously
-    and returns their responses for comparison. It supports:
-    - All four platforms: 智谱AI (zhipu), 千问 (qwen), Kimi (kimi), MiniMax (minimax)
-    - Parallel querying for faster results
-    - Response format options (markdown or JSON)
+    state = HTTPBrowserState()
+    http_state = state
+    compare_open_task: Optional[asyncio.Task] = None
+    port = getattr(mcp.settings, "port", 8000)
+    compare_url_prefix = f"http://localhost:{port}"
+    compare_url_prefix_alt = f"http://127.0.0.1:{port}"
 
-    Args:
-        params (CompareLLMsInput): Validated input parameters containing:
-            - question (str): The question to ask all LLM platforms
-            - platforms (Optional[List[Platform]]): List of platforms to query
-            - response_format (ResponseFormat): Output format (markdown or JSON)
-
-    Returns:
-        str: JSON-formatted comparison results with the following schema:
-
-        Success response:
-        {
-            "question": str,           # The original question
-            "responses": [
-                {
-                    "platform": str,   # Platform name (zhipu, qwen, kimi, minimax)
-                    "response": str,   # The LLM's response text
-                    "elapsed_time": float,  # Time taken in seconds
-                    "status": str     # "success" or "error"
-                }
-            ],
-            "analysis": {
-                "total_platforms": int,
-                "successful": int,
-                "failed": int,
-                "platforms": [...]
-            }
-        }
-
-        Error response:
-        "Error: <error message>"
-    """
     try:
-        # Determine which platforms to query
-        platforms_to_query = params.platforms if params.platforms else list(Platform)
+        state.playwright = await async_playwright().start()
 
-        # Query all platforms in parallel
-        tasks = [query_platform(p, params.question) for p in platforms_to_query]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        # Try to connect to existing browser (from a previous run that did not close)
+        try:
+            browser = await state.playwright.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{CDP_PORT}"
+            )
+            contexts = browser.contexts
+            if contexts:
+                ctx = contexts[0]
+                state.browser = browser
+                state.context = ctx
+                for page in ctx.pages:
+                    if page.is_closed():
+                        continue
+                    url = page.url
+                    for pid, base_url in PLATFORM_URLS.items():
+                        if url.startswith(base_url) or base_url.rstrip("/") in url:
+                            state.pages[pid] = page
+                            state.reply_statuses[pid] = "question_sent"
+                            break
+                    if state.compare_page is None and (
+                        url.startswith(compare_url_prefix + "/")
+                        or url.startswith(compare_url_prefix_alt + "/")
+                        or (str(port) in url and ("localhost" in url or "127.0.0.1" in url))
+                    ):
+                        state.compare_page = page
+                # Open any missing platform tab
+                for pid, url in PLATFORM_URLS.items():
+                    if pid not in state.pages or state.pages[pid].is_closed():
+                        page = await state.context.new_page()
+                        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                        state.pages[pid] = page
+                        state.reply_statuses[pid] = "question_sent"
+                # Open compare tab if missing
+                if state.compare_page is None or state.compare_page.is_closed():
+                    state.compare_page = await state.context.new_page()
 
-        # Process responses
-        processed_responses = []
-        for i, response in enumerate(responses):
-            if isinstance(response, Exception):
-                processed_responses.append({
-                    "platform": platforms_to_query[i].value,
-                    "response": {"error": str(response)},
-                    "elapsed_time": 0,
-                    "status": "error"
-                })
-            else:
-                processed_responses.append(response)
+                    async def _open_compare_after_server_up() -> None:
+                        async with httpx.AsyncClient() as client:
+                            for _ in range(30):
+                                await asyncio.sleep(0.5)
+                                try:
+                                    r = await client.get(
+                                        f"http://127.0.0.1:{port}/health",
+                                        timeout=2.0,
+                                    )
+                                    if r.status_code == 200:
+                                        break
+                                except Exception:
+                                    continue
+                            else:
+                                return
+                        try:
+                            await state.compare_page.goto(
+                                compare_url_prefix + "/",
+                                wait_until="domcontentloaded",
+                                timeout=15000,
+                            )
+                        except Exception:
+                            pass
 
-        # Analyze responses
-        analysis = await analyze_responses(processed_responses)
+                    compare_open_task = asyncio.create_task(_open_compare_after_server_up())
+                yield state
+                return
+            try:
+                await browser.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
-        result = {
-            "question": params.question,
-            "responses": processed_responses,
-            "analysis": analysis
-        }
+        # No existing browser: launch new one with CDP port so next restart can reconnect
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
+        state.context = await state.playwright.chromium.launch_persistent_context(
+            USER_DATA_DIR,
+            headless=False,
+            args=[f"--remote-debugging-port={CDP_PORT}"],
+        )
+        state.browser = state.context
 
-        if params.response_format == ResponseFormat.JSON:
-            return json.dumps(result, indent=2, ensure_ascii=False)
-        else:
-            # Format as markdown
-            lines = ["# LLM Response Comparison", ""]
-            lines.append(f"**Question:** {params.question}")
-            lines.append(f"**Total Platforms:** {analysis['total_platforms']}")
-            lines.append(f"**Successful:** {analysis['successful']} | **Failed:** {analysis['failed']}")
-            lines.append("")
+        async def open_one_tab(platform_id: str, url: str) -> None:
+            page = await state.context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            state.pages[platform_id] = page
+            state.reply_statuses[platform_id] = "question_sent"
 
-            for resp in processed_responses:
-                platform = resp.get("platform", "unknown")
-                status = resp.get("status", "unknown")
-                elapsed = resp.get("elapsed_time", 0)
+        await asyncio.gather(
+            *[open_one_tab(pid, url) for pid, url in PLATFORM_URLS.items()]
+        )
 
-                lines.append(f"## {platform.upper()}")
-                lines.append(f"**Status:** {status} | **Time:** {elapsed:.2f}s")
-                lines.append("")
+        state.compare_page = await state.context.new_page()
 
-                if status == "success":
-                    text = resp.get("response", {}).get("text", "")
-                    lines.append(text[:2000])  # Truncate long responses
+        async def _open_compare_after_server_up() -> None:
+            async with httpx.AsyncClient() as client:
+                for _ in range(30):
+                    await asyncio.sleep(0.5)
+                    try:
+                        r = await client.get(
+                            f"http://127.0.0.1:{port}/health",
+                            timeout=2.0,
+                        )
+                        if r.status_code == 200:
+                            break
+                    except Exception:
+                        continue
                 else:
-                    error = resp.get("response", {}).get("error", "Unknown error")
-                    lines.append(f"**Error:** {error}")
+                    return
+            try:
+                await state.compare_page.goto(
+                    compare_url_prefix + "/",
+                    wait_until="domcontentloaded",
+                    timeout=15000,
+                )
+            except Exception:
+                pass
 
-                lines.append("")
-                lines.append("---")
-                lines.append("")
+        compare_open_task = asyncio.create_task(_open_compare_after_server_up())
 
-            # Add analysis summary
-            lines.append("## Analysis Summary")
-            lines.append("")
-            lines.append("| Platform | Status | Time (s) | Words |")
-            lines.append("|----------|--------|----------|-------|")
-
-            for platform_data in analysis.get("platforms", []):
-                p = platform_data.get("platform", "unknown")
-                s = platform_data.get("status", "unknown")
-                t = platform_data.get("elapsed_time", 0)
-                w = platform_data.get("word_count", 0)
-                lines.append(f"| {p} | {s} | {t:.2f} | {w} |")
-
-            return "\n".join(lines)
-
-    except Exception as e:
-        return f"Error: {str(e)}"
+        yield state
+    finally:
+        if compare_open_task is not None and not compare_open_task.done():
+            compare_open_task.cancel()
+            try:
+                await compare_open_task
+            except asyncio.CancelledError:
+                pass
+        # Do not close browser/tabs on exit: keep the four platform pages and comparison page open
+        state.pages.clear()
+        state.compare_page = None
+        state.context = None
+        state.browser = None
+        # Do not call context.close() or playwright.stop() so the browser window and tabs remain open
+        http_state = None
 
 
-@mcp.tool(
-    name="llm_query_single",
-    annotations={
-        "title": "Query Single LLM Platform",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True
-    }
-)
-async def llm_query_single(params: SingleQueryInput) -> str:
-    """Query a single LLM platform.
+def _get_lifespan(app: Any):
+    """Lifespan for HTTP mode: open browser and 5 tabs on startup."""
+    return _http_browser_lifespan(app)
 
-    This tool sends a question to a specific LLM platform and returns its response.
-    Use this when you only need to query one platform instead of all of them.
 
-    Args:
-        params (SingleQueryInput): Validated input parameters containing:
-            - platform (Platform): The platform to query (zhipu, qwen, kimi, minimax)
-            - question (str): The question to ask
+mcp = FastMCP("llm_comparison_mcp", lifespan=_get_lifespan)
 
-    Returns:
-        str: JSON-formatted response with the following schema:
 
-        Success response:
-        {
-            "platform": str,
-            "response": str,
-            "elapsed_time": float,
-            "status": "success"
-        }
+# ----- Custom HTTP routes (comparison UI and API) -----
+def _get_http_state() -> Optional[HTTPBrowserState]:
+    return http_state
 
-        Error response:
-        {
-            "platform": str,
-            "response": {"error": str},
-            "elapsed_time": float,
-            "status": "error"
-        }
-    """
+
+@mcp.custom_route("/", methods=["GET"], include_in_schema=False)
+async def serve_compare_page(request: Request) -> Response:
+    """Serve the comparison frontend (index.html)."""
+    index_path = os.path.join(FRONTEND_DIR, "index.html")
+    if os.path.isfile(index_path):
+        return FileResponse(index_path, media_type="text/html")
+    return JSONResponse({"error": "Frontend not found"}, status_code=404)
+
+
+@mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
+async def health_check(request: Request) -> Response:
+    """Health check for the server."""
+    state = _get_http_state()
+    return JSONResponse({
+        "status": "ok",
+        "browser_ready": state is not None and state.browser is not None,
+    })
+
+
+@mcp.custom_route("/query", methods=["POST"], include_in_schema=False)
+async def api_query(request: Request) -> Response:
+    """Send question to selected platform tabs."""
+    state = _get_http_state()
+    if not state or not state.pages:
+        return JSONResponse(
+            {"ok": False, "error": "Browser or tabs not ready. Start server with HTTP mode (port)."},
+            status_code=503,
+        )
     try:
-        result = await query_platform(params.platform, params.question)
+        body = await request.json()
+        question = (body.get("question") or "").strip()
+        platforms = body.get("platforms") or ["zhipu", "qwen", "kimi", "minimax"]
+        if not question:
+            return JSONResponse({"ok": False, "error": "question is required"}, status_code=400)
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid JSON body"}, status_code=400)
 
-        if params.response_format == ResponseFormat.JSON:
-            return json.dumps(result, indent=2, ensure_ascii=False)
-        else:
-            lines = [f"# {params.platform.value.upper()} Response", ""]
-            lines.append(f"**Status:** {result.get('status')}")
-            lines.append(f"**Time:** {result.get('elapsed_time', 0):.2f}s")
-            lines.append("")
+    async with state._lock:
+        state.last_question = question
+        for pid in list(state.pages.keys()):
+            if pid in platforms:
+                state.reply_statuses[pid] = "question_sent"
 
-            if result.get("status") == "success":
-                lines.append(result.get("response", {}).get("text", ""))
-            else:
-                lines.append(f"**Error:** {result.get('response', {}).get('error', 'Unknown error')}")
+    errors = []
+    for pid in platforms:
+        page = state.pages.get(pid)
+        if not page or page.is_closed():
+            errors.append(f"{pid}: no page")
+            continue
+        err = await send_question_to_page(pid, page, question)
+        if err:
+            errors.append(f"{pid}: {err}")
+            async with state._lock:
+                state.reply_statuses[pid] = "error"
 
-            return "\n".join(lines)
+    return JSONResponse({
+        "ok": True,
+        "message": "Question sent to selected platforms.",
+        "errors": errors if errors else None,
+    })
 
-    except Exception as e:
-        return f"Error: {str(e)}"
+
+@mcp.custom_route("/status", methods=["GET"], include_in_schema=False)
+async def api_status(request: Request) -> Response:
+    """Return current reply status per platform (for UI polling)."""
+    state = _get_http_state()
+    if not state:
+        return JSONResponse({"platforms": {}, "question": None})
+    async with state._lock:
+        # Map internal keys to display labels
+        display = {}
+        for pid, key in state.reply_statuses.items():
+            display[pid] = REPLY_STATUS.get(key, key)
+        return JSONResponse({
+            "platforms": display,
+            "question": state.last_question,
+        })
 
 
-@mcp.tool(
-    name="llm_check_login",
-    annotations={
-        "title": "Check LLM Platform Login Status",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True
-    }
-)
-async def llm_check_login(params: LoginStatusInput) -> str:
-    """Check login status for LLM platforms.
+@mcp.custom_route("/fetch-replies", methods=["POST"], include_in_schema=False)
+async def api_fetch_replies(request: Request) -> Response:
+    """Fetch latest reply from each platform tab and return for side-by-side comparison."""
+    state = _get_http_state()
+    if not state or not state.pages:
+        return JSONResponse(
+            {"ok": False, "error": "Browser or tabs not ready."},
+            status_code=503,
+        )
+    responses = []
+    async with state._lock:
+        question = state.last_question
+    for pid, page in state.pages.items():
+        if not page or page.is_closed():
+            responses.append({"platform": pid, "text": "", "status": "error", "error": "page closed"})
+            continue
+        try:
+            result = await get_latest_reply(page, pid)
+            status = state.reply_statuses.get(pid, "unknown")
+            responses.append({
+                "platform": pid,
+                "text": result.get("text") or "",
+                "status": "error" if result.get("error") else "success",
+                "error": result.get("error"),
+            })
+        except Exception as e:
+            responses.append({"platform": pid, "text": "", "status": "error", "error": str(e)})
 
-    This tool checks whether the user is logged in to the specified LLM platforms.
-    If cookies are saved, they will be loaded and used. If not logged in,
-    the tool will provide instructions for manual login.
+    return JSONResponse({
+        "ok": True,
+        "question": question,
+        "responses": responses,
+    })
 
-    Args:
-        params (LoginStatusInput): Validated input parameters containing:
-            - platform (Optional[Platform]): Specific platform to check
 
-    Returns:
-        str: JSON-formatted status information with the following schema:
-
-        [
-            {
-                "platform": str,
-                "logged_in": bool,
-                "status": str,
-                "message": str (optional)
-            }
-        ]
-    """
+@mcp.custom_route("/open-platforms", methods=["POST"], include_in_schema=False)
+async def api_open_platforms(request: Request) -> Response:
+    """Open new tabs for platforms that are not open or whose tab was closed. Same window."""
+    state = _get_http_state()
+    if not state or not state.context:
+        return JSONResponse(
+            {"ok": False, "error": "Browser not ready. Start server with HTTP mode (port)."},
+            status_code=503,
+        )
     try:
-        platforms_to_check = [params.platform] if params.platform else list(Platform)
+        body = await request.json() if request.headers.get("content-length") else {}
+    except Exception:
+        body = {}
+    want = body.get("platforms") or list(PLATFORM_URLS.keys())
 
-        tasks = [check_login_status(p) for p in platforms_to_check]
-        results = await asyncio.gather(*tasks)
+    to_open = []
+    async with state._lock:
+        for platform_id in want:
+            url = PLATFORM_URLS.get(platform_id)
+            if not url:
+                continue
+            page = state.pages.get(platform_id)
+            if page and not page.is_closed():
+                continue
+            to_open.append(platform_id)
 
-        return json.dumps(results, indent=2, ensure_ascii=False)
+    opened = []
+    errors = []
+    for platform_id in to_open:
+        url = PLATFORM_URLS[platform_id]
+        try:
+            page = await state.context.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            async with state._lock:
+                state.pages[platform_id] = page
+                state.reply_statuses[platform_id] = "question_sent"
+            opened.append(platform_id)
+        except Exception as e:
+            errors.append(f"{platform_id}: {e}")
 
-    except Exception as e:
-        return f"Error: {str(e)}"
-
-
-@mcp.tool(
-    name="llm_save_session",
-    annotations={
-        "title": "Save Current Browser Session",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True
-    }
-)
-async def llm_save_session(platform: str = Field(..., description="Platform to save session for (zhipu, qwen, kimi, minimax)")) -> str:
-    """Save the current browser session (cookies) for a platform.
-
-    This tool saves the current browser session cookies to a file,
-    so they can be loaded later for automatic login.
-
-    Args:
-        platform (str): The platform to save session for
-
-    Returns:
-        str: JSON-formatted result with status
-    """
-    try:
-        p = Platform(platform)
-        context = browser_pool.contexts.get(p)
-
-        if not context:
-            return json.dumps({"status": "error", "message": "No active session for this platform"})
-
-        cookies = await context.cookies()
-        await save_cookies(p, cookies)
-
-        return json.dumps({"status": "success", "message": f"Session saved for {platform}"})
-
-    except ValueError:
-        return json.dumps({"status": "error", "message": f"Invalid platform: {platform}"})
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+    return JSONResponse({
+        "ok": True,
+        "message": "Opened missing platform tabs.",
+        "opened": opened,
+        "errors": errors if errors else None,
+    })
 
 
 if __name__ == "__main__":
     import sys
-    # Run with optional port for HTTP transport
     port = int(sys.argv[1]) if len(sys.argv) > 1 else None
     if port:
-        mcp.run(transport="streamable_http", port=port)
+        mcp.settings.port = port
+        # FastMCP 的 streamable_http_app() 只使用 session_manager 的 lifespan，
+        # 不会调用我们传入的 lifespan，因此需要包装一层：先执行浏览器 lifespan，再执行 session_manager
+        import uvicorn
+        from starlette.applications import Starlette
+
+        original_app = mcp.streamable_http_app()
+
+        @asynccontextmanager
+        async def combined_lifespan(app: Any):
+            async with _http_browser_lifespan(app):
+                async with mcp._session_manager.run():
+                    yield
+
+        wrapper_app = Starlette(
+            debug=mcp.settings.debug,
+            routes=[],
+            lifespan=combined_lifespan,
+        )
+        wrapper_app.mount("/", original_app)
+
+        config = uvicorn.Config(
+            wrapper_app,
+            host=getattr(mcp.settings, "host", "0.0.0.0"),
+            port=port,
+            log_level=getattr(mcp.settings, "log_level", "info").lower(),
+        )
+        server = uvicorn.Server(config)
+        asyncio.run(server.serve())
     else:
         mcp.run()

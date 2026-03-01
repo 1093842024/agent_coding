@@ -132,6 +132,34 @@
             transform: none;
         }
 
+        .button-row {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            margin-top: 25px;
+            flex-wrap: wrap;
+        }
+
+        .button-row .submit-btn {
+            margin: 0;
+        }
+
+        .fetch-btn {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }
+
+        .fetch-btn:hover {
+            box-shadow: 0 10px 20px rgba(17, 153, 142, 0.4);
+        }
+
+        .open-platforms-btn {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        }
+
+        .open-platforms-btn:hover {
+            box-shadow: 0 10px 20px rgba(245, 87, 108, 0.4);
+        }
+
         .loading {
             text-align: center;
             padding: 40px;
@@ -246,12 +274,24 @@
         }
 
         .response-text {
-            white-space: pre-wrap;
             line-height: 1.6;
             color: #333;
             max-height: 400px;
             overflow-y: auto;
         }
+        .response-text pre {
+            background: #f5f5f5;
+            padding: 12px;
+            border-radius: 8px;
+            overflow-x: auto;
+        }
+        .response-text code {
+            font-family: ui-monospace, monospace;
+            font-size: 0.9em;
+        }
+        .response-text p { margin: 0.5em 0; }
+        .response-text ul, .response-text ol { margin: 0.5em 0; padding-left: 1.5em; }
+        .response-text h1, .response-text h2, .response-text h3 { margin: 0.75em 0 0.25em; }
 
         .analysis-table {
             width: 100%;
@@ -339,6 +379,8 @@
             border-radius: 8px;
         }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
 </head>
 <body>
     <div class="container">
@@ -380,19 +422,27 @@
                 </label>
             </div>
 
-            <button class="submit-btn" id="submitBtn" onclick="submitQuestion()">
-                Compare Responses
-            </button>
+            <div class="button-row">
+                <button class="submit-btn" id="submitBtn" onclick="submitQuestion()">
+                    发送问题
+                </button>
+                <button class="submit-btn fetch-btn" id="fetchRepliesBtn" onclick="fetchRepliesAndCompare()">
+                    获取回复并对比
+                </button>
+                <button class="submit-btn open-platforms-btn" id="openPlatformsBtn" onclick="openMissingPlatforms()" title="在浏览器中新建标签页打开未打开的模型网站">
+                    打开未打开的模型网站
+                </button>
+            </div>
         </div>
 
         <div id="loadingSection" class="loading" style="display: none;">
             <div class="spinner"></div>
-            <p>Querying multiple LLM platforms...</p>
+            <p id="loadingText">发送中...</p>
         </div>
 
         <div id="resultsSection" class="results-section">
             <div class="tabs">
-                <button class="tab active" onclick="switchTab('raw')">Raw Responses</button>
+                <button class="tab active" onclick="switchTab('raw')">并排对比回复</button>
                 <button class="tab" onclick="switchTab('analysis')">Analysis</button>
             </div>
 
@@ -414,10 +464,12 @@
     </div>
 
     <script>
+        const API_BASE = '';  // same origin when served from server
+
         async function submitQuestion() {
             const question = document.getElementById('questionInput').value.trim();
             if (!question) {
-                alert('Please enter a question');
+                alert('请输入问题');
                 return;
             }
 
@@ -427,87 +479,154 @@
             });
 
             if (platforms.length === 0) {
-                alert('Please select at least one platform');
+                alert('请至少选择一个平台');
                 return;
             }
 
             const submitBtn = document.getElementById('submitBtn');
             submitBtn.disabled = true;
-            submitBtn.textContent = 'Querying...';
-
+            document.getElementById('loadingText').textContent = '正在发送问题...';
             document.getElementById('loadingSection').style.display = 'block';
-            document.getElementById('resultsSection').style.display = 'none';
 
             try {
-                // Call MCP server (assuming it's running on port 8000)
-                const response = await fetch('http://localhost:8000/query', {
+                const response = await fetch(API_BASE + '/query', {
                     method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        question: question,
-                        platforms: platforms
-                    })
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ question: question, platforms: platforms })
                 });
-
                 const data = await response.json();
-                displayResults(question, data);
+                if (!data.ok) {
+                    alert(data.error || '发送失败');
+                    return;
+                }
+                document.getElementById('displayQuestion').textContent = question;
+                if (data.errors && data.errors.length) {
+                    alert('部分平台发送失败：' + data.errors.join('；'));
+                }
             } catch (error) {
-                // Fallback: show mock data for demonstration
                 console.error('Error:', error);
-                alert('MCP server not running. Showing demo data.');
-                showDemoData(question);
+                alert('服务未就绪，请确认已用 HTTP 模式启动（如：uv run python -m src.server 8000）');
             } finally {
-                submitBtn.disabled = false;
-                submitBtn.textContent = 'Compare Responses';
                 document.getElementById('loadingSection').style.display = 'none';
+                submitBtn.disabled = false;
+            }
+        }
+
+        async function openMissingPlatforms() {
+            const btn = document.getElementById('openPlatformsBtn');
+            btn.disabled = true;
+            try {
+                const response = await fetch(API_BASE + '/open-platforms', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})
+                });
+                const data = await response.json();
+                if (!data.ok) {
+                    alert(data.error || '打开失败');
+                    return;
+                }
+                const names = { zhipu: '智谱AI', qwen: '千问', kimi: 'Kimi', minimax: 'MiniMax' };
+                if (data.opened && data.opened.length) {
+                    const list = data.opened.map(p => names[p] || p).join('、');
+                    alert('已打开：' + list + (data.errors && data.errors.length ? '\n失败：' + data.errors.join('；') : ''));
+                } else if (data.errors && data.errors.length) {
+                    alert('打开失败：' + data.errors.join('；'));
+                } else {
+                    alert('四个平台标签页均已存在，无需打开。');
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                alert('服务未就绪或请求失败');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function fetchRepliesAndCompare() {
+            const fetchBtn = document.getElementById('fetchRepliesBtn');
+            fetchBtn.disabled = true;
+            document.getElementById('loadingText').textContent = '正在获取各平台最新回复...';
+            document.getElementById('loadingSection').style.display = 'block';
+
+            try {
+                const response = await fetch(API_BASE + '/fetch-replies', { method: 'POST' });
+                const data = await response.json();
+                document.getElementById('loadingSection').style.display = 'none';
+                if (!data.ok) {
+                    alert(data.error || '获取失败');
+                    return;
+                }
+                document.getElementById('resultsSection').style.display = 'block';
+                document.getElementById('displayQuestion').textContent = data.question || '(当前问题)';
+                const grid = document.getElementById('responseGrid');
+                grid.innerHTML = '';
+                (data.responses || []).forEach(resp => {
+                    const card = document.createElement('div');
+                    card.className = 'response-card';
+                    const badgeClass = resp.status === 'success' ? 'badge-success' : 'badge-error';
+                    const raw = resp.status === 'success' ? (resp.text || '') : (resp.error || 'Unknown error');
+                    const contentHtml = resp.status === 'success' ? renderMarkdown(raw) : escapeHtml(raw);
+                    card.innerHTML = `
+                        <div class="response-header">
+                            <div>
+                                <span class="platform-name">${escapeHtml((resp.platform || '').toUpperCase())}</span>
+                            </div>
+                            <span class="platform-badge ${badgeClass}">${escapeHtml(resp.status)}</span>
+                        </div>
+                        <div class="response-text">${contentHtml}</div>
+                    `;
+                    grid.appendChild(card);
+                });
+                if (data.responses && data.responses.length) {
+                    const summary = { total_platforms: data.responses.length, successful: data.responses.filter(r => r.status === 'success').length, failed: data.responses.filter(r => r.status !== 'success').length, platforms: data.responses.map(r => ({ platform: r.platform, status: r.status, word_count: (r.text || '').split(/\s+/).length })) };
+                    displayAnalysis(summary);
+                }
+            } catch (error) {
+                document.getElementById('loadingSection').style.display = 'none';
+                console.error('Error:', error);
+                alert('获取回复失败');
+            } finally {
+                fetchBtn.disabled = false;
             }
         }
 
         function displayResults(question, data) {
             document.getElementById('resultsSection').style.display = 'block';
             document.getElementById('displayQuestion').textContent = question;
-
             const grid = document.getElementById('responseGrid');
             grid.innerHTML = '';
-
-            data.responses.forEach(resp => {
+            (data.responses || []).forEach(resp => {
                 const card = document.createElement('div');
                 card.className = 'response-card';
-
                 const badgeClass = resp.status === 'success' ? 'badge-success' : 'badge-error';
-                const responseText = resp.status === 'success'
-                    ? (resp.response?.text || 'No response')
-                    : (resp.response?.error || 'Unknown error');
-
+                const rawText = resp.status === 'success'
+                    ? (resp.response?.text != null ? resp.response.text : resp.text || '')
+                    : (resp.response?.error || resp.error || 'Unknown error');
+                const contentHtml = resp.status === 'success' ? renderMarkdown(rawText) : escapeHtml(rawText);
                 card.innerHTML = `
                     <div class="response-header">
                         <div>
-                            <span class="platform-name">${resp.platform.toUpperCase()}</span>
-                            <span class="response-time">${resp.elapsed_time?.toFixed(2) || 0}s</span>
+                            <span class="platform-name">${escapeHtml((resp.platform || '').toUpperCase())}</span>
+                            ${resp.elapsed_time != null ? '<span class="response-time">' + escapeHtml(resp.elapsed_time.toFixed(2)) + 's</span>' : ''}
                         </div>
-                        <span class="platform-badge ${badgeClass}">${resp.status}</span>
+                        <span class="platform-badge ${badgeClass}">${escapeHtml(resp.status)}</span>
                     </div>
-                    <div class="response-text">${escapeHtml(responseText)}</div>
+                    <div class="response-text">${contentHtml}</div>
                 `;
-
                 grid.appendChild(card);
             });
-
-            // Display analysis
-            displayAnalysis(data.analysis);
+            if (data.analysis) displayAnalysis(data.analysis);
         }
 
         function displayAnalysis(analysis) {
             const content = document.getElementById('analysisContent');
+            if (!analysis || !analysis.platforms) return;
 
             let html = `
                 <div class="status-section">
                     <h3>Summary</h3>
-                    <p>Total Platforms: ${analysis.total_platforms} |
-                       Successful: ${analysis.successful} |
-                       Failed: ${analysis.failed}</p>
+                    <p>Total: ${analysis.total_platforms} | Successful: ${analysis.successful} | Failed: ${analysis.failed}</p>
                 </div>
 
                 <table class="analysis-table">
@@ -527,8 +646,8 @@
                     <tr>
                         <td>${p.platform}</td>
                         <td>${p.status}</td>
-                        <td>${p.elapsed_time?.toFixed(2) || 0}s</td>
-                        <td>${p.word_count || 0}</td>
+                        <td>${p.elapsed_time != null ? p.elapsed_time.toFixed(2) + 's' : '-'}</td>
+                        <td>${p.word_count != null ? p.word_count : 0}</td>
                     </tr>
                 `;
             });
@@ -610,6 +729,14 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        function renderMarkdown(text) {
+            if (typeof marked === 'undefined' || typeof DOMPurify === 'undefined') {
+                return escapeHtml(text).replace(/\n/g, '<br>');
+            }
+            const rawHtml = marked.parse(text || '', { gfm: true, breaks: true });
+            return DOMPurify.sanitize(rawHtml, { ALLOWED_TAGS: ['p', 'br', 'strong', 'em', 'code', 'pre', 'ul', 'ol', 'li', 'h1', 'h2', 'h3', 'h4', 'a', 'blockquote', 'hr'] });
         }
 
         // Check server status on load
