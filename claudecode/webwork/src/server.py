@@ -70,6 +70,15 @@ def _chromium_executable() -> Optional[str]:
                 return path
     except Exception:
         pass
+    # macOS: Chrome/Chromium are typically in /Applications and not on PATH
+    if sys.platform == "darwin":
+        for app_name, binary in (
+            ("Google Chrome.app", "Google Chrome"),
+            ("Chromium.app", "Chromium"),
+        ):
+            path = f"/Applications/{app_name}/Contents/MacOS/{binary}"
+            if os.path.isfile(path):
+                return path
     for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
         path = shutil.which(name)
         if path:
@@ -860,7 +869,9 @@ async def _http_browser_lifespan(app: Any):
             else:
                 launched = False
         if not launched:
-            # Fallback: launch as child (browser will close when process exits)
+            # Fallback: launch as child with same USER_DATA_DIR so login state is preserved.
+            # Note: browser will close when process exits (e.g. Ctrl+C); use Chrome in
+            # /Applications (macOS) or on PATH so detached launch succeeds to keep browser open.
             state.context = await state.playwright.chromium.launch_persistent_context(
                 USER_DATA_DIR,
                 headless=False,
