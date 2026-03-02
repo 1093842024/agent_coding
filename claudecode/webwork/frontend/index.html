@@ -500,8 +500,17 @@
                     return;
                 }
                 document.getElementById('displayQuestion').textContent = question;
+                const platformNames = { zhipu: '智谱AI', qwen: '千问', kimi: 'Kimi', minimax: 'MiniMax' };
                 if (data.errors && data.errors.length) {
                     alert('部分平台发送失败：' + data.errors.join('；'));
+                }
+                if (data.not_logged_in && data.not_logged_in.length) {
+                    const names = data.not_logged_in.map(p => platformNames[p] || p).join('、');
+                    alert('以下平台未登录，请先在对应标签页中登录后再发送问题：' + names);
+                }
+                if (!(data.errors && data.errors.length) && (!data.not_logged_in || !data.not_logged_in.length)) {
+                    // 全部发送成功且均已登录
+                    alert('问题已发送成功，可在各平台标签页查看回复。');
                 }
             } catch (error) {
                 console.error('Error:', error);

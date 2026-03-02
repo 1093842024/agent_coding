@@ -365,6 +365,27 @@ async def send_question_to_page(platform_id: str, page: Any, question: str) -> O
     return "Unknown platform"
 
 
+async def _check_page_logged_in(page: Any) -> bool:
+    """Check if the current page appears to be in a logged-in state (user avatar/profile visible)."""
+    if not page or page.is_closed():
+        return False
+    try:
+        return await page.evaluate("""() => {
+            const indicators = [
+                document.querySelector('[data-testid="user-avatar"]'),
+                document.querySelector('.user-profile'),
+                document.querySelector('[class*="avatar"]'),
+                document.querySelector('[class*="nickname"]'),
+                document.querySelector('[class*="user-info"]'),
+                document.querySelector('img[alt*="头像"]'),
+                document.querySelector('img[alt*="avatar"]'),
+            ];
+            return indicators.some(el => el !== null);
+        }""")
+    except Exception:
+        return False
+
+
 # ----- Get latest reply text from page (platform-specific selectors) -----
 # Min length to consider as a real reply (avoid picking empty or input-like nodes)
 REPLY_MIN_TEXT_LEN = 15
@@ -1002,10 +1023,22 @@ async def api_query(request: Request) -> Response:
             async with state._lock:
                 state.reply_statuses[pid] = "error"
 
+    # Check login status for each requested platform (so UI can prompt user to log in)
+    login_status: Dict[str, bool] = {}
+    for pid in platforms:
+        page = state.pages.get(pid)
+        if page and not page.is_closed():
+            login_status[pid] = await _check_page_logged_in(page)
+        else:
+            login_status[pid] = False
+    not_logged_in = [pid for pid in platforms if not login_status.get(pid, False)]
+
     return JSONResponse({
         "ok": True,
         "message": "Question sent to selected platforms.",
         "errors": errors if errors else None,
+        "login_status": login_status,
+        "not_logged_in": not_logged_in,
     })
 
 
